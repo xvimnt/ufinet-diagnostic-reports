@@ -1,1 +1,5 @@
 reports/*
+
+# Virtual environment
+.venv
+venv
