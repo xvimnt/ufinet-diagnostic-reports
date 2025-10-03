@@ -3,3 +3,7 @@ reports/*
 # Virtual environment
 .venv
 venv
+
+# Results
+category_match_report.xlsx
+category_match_report.csv

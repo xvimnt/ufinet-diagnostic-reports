@@ -9,6 +9,7 @@ import sys
 from typing import Dict, Tuple, List
 import unicodedata
 from datetime import datetime
+import re
 
 try:
     from openpyxl import Workbook
@@ -75,6 +76,88 @@ DEFAULT_MAPPING_RAW = {
 DEFAULT_MAPPING: Dict[str, str] = {normalize_slug(k): normalize_slug(v) for k, v in DEFAULT_MAPPING_RAW.items()}
 
 
+EXPECTED_HEADER_SLUGS = {
+    "category",
+    "new_result",
+    "administrative_code",
+    "json",
+    "id",
+    "created_at",
+    "end_at",
+}
+
+
+def infer_fallback_fieldnames(sample_row: List[str]) -> List[str]:
+    """Infer sensible column names when CSV files are missing a header row.
+
+    Assumes the canonical order:
+    ADMINISTRATIVE_CODE;ID;CATEGORY;JSON;NEW_RESULT;CREATED_AT;END_AT
+    and tries to map columns heuristically when more data is present.
+    """
+
+    base_names = [
+        "ADMINISTRATIVE_CODE",
+        "ID",
+        "CATEGORY",
+        "JSON",
+        "NEW_RESULT",
+    ]
+    if len(sample_row) <= len(base_names):
+        names = base_names[: len(sample_row)]
+    else:
+        extra_count = len(sample_row) - len(base_names)
+        names = base_names + [f"EXTRA_{i}" for i in range(1, extra_count + 1)]
+
+    json_idx = None
+    new_result_idx = None
+    date_labels = ["CREATED_AT", "END_AT"]
+    date_idx = 0
+
+    for idx, raw in enumerate(sample_row):
+        if idx >= len(names):
+            continue
+        value = (raw or "").strip()
+        lower_value = value.lower()
+
+        if json_idx is None and lower_value.startswith("{") and (
+            "'diagnostic_type'" in lower_value or '"diagnostic_type"' in lower_value
+        ):
+            json_idx = idx
+
+        if new_result_idx is None and (
+            "'category'" in lower_value or '"category"' in lower_value
+        ):
+            new_result_idx = idx
+
+        if names[idx] not in {"ADMINISTRATIVE_CODE", "ID", "CATEGORY", "JSON", "NEW_RESULT"}:
+            if re.search(r"\d{4}-\d{2}-\d{2}", value):
+                if date_idx < len(date_labels):
+                    names[idx] = date_labels[date_idx]
+                    date_idx += 1
+
+    if json_idx is not None:
+        names[json_idx] = "JSON"
+
+    if new_result_idx is None and names:
+        new_result_idx = len(names) - 1
+    if new_result_idx is not None:
+        names[new_result_idx] = "NEW_RESULT"
+
+    if names.count("JSON") > 1:
+        first_json = names.index("JSON")
+        for idx in range(first_json + 1, len(names)):
+            if names[idx] == "JSON":
+                names[idx] = f"EXTRA_{idx}"
+
+    if names.count("NEW_RESULT") > 1:
+        first_new_result = names.index("NEW_RESULT")
+        for idx in range(first_new_result + 1, len(names)):
+            if names[idx] == "NEW_RESULT":
+                names[idx] = f"EXTRA_{idx}"
+
+    return names
+
+
 def parse_new_result_category(value: str) -> str:
     if value is None:
         return ""
@@ -117,7 +200,27 @@ def evaluate_file(path: str, mapping: Dict[str, str]) -> Tuple[str, int, int, in
     delimiter = ';'
 
     with open(path, 'r', encoding='utf-8-sig', newline='') as f:
-        reader = csv.DictReader(f, delimiter=delimiter)
+        peek_reader = csv.reader(f, delimiter=delimiter)
+        try:
+            first_row = next(peek_reader)
+        except StopIteration:
+            fname = os.path.basename(path)
+            return (fname, 0, 0, 0, 0.0, mismatch_rows)
+
+        has_header = any(
+            normalize_slug(cell) in EXPECTED_HEADER_SLUGS for cell in first_row
+        )
+
+        f.seek(0)
+        if has_header:
+            reader = csv.DictReader(f, delimiter=delimiter)
+        else:
+            fallback_fieldnames = infer_fallback_fieldnames(first_row)
+            reader = csv.DictReader(
+                f,
+                delimiter=delimiter,
+                fieldnames=fallback_fieldnames,
+            )
         # Normalize header keys to upper for resilience
         field_map = {k: k for k in reader.fieldnames or []}
         # Expected fields
